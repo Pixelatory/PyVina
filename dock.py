@@ -1,14 +1,18 @@
+from functools import partial
 import os
 import subprocess
 import re
 import time
 import shutil
 import pandas as pd
+import multiprocessing
 
-from typing import Dict, List, Union
+from typing import Dict, Iterable, List, Union
 from tqdm import tqdm
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from tdc.generation import MolGen
+
 
 try:
     import meeko
@@ -32,6 +36,9 @@ def delete_all():
     if os.path.exists('./outputs/'):
         shutil.rmtree('./outputs/')
 
+def sanitize_smi_name_for_file(smi: str):
+    return smi.replace('(', '{').replace(')', '}').replace('\\', r'%5C').replace('/', r'%2F').replace('#', '%23')
+
 def move_files_from_dir(source_dir_path: str, dest_dir_path: str):
     files = os.listdir(source_dir_path)
     for file in files:
@@ -47,14 +54,57 @@ def delete_dir_contents(dir_path: str):
         elif os.path.isdir(item_path):
             shutil.rmtree(item_path)
 
+def execute_shell_process(cmd_str: str, error_msg: str = None, print_output: bool = False, timeout_duration: int = None) -> None:
+    with subprocess.Popen(cmd_str, shell=True, start_new_session=True) as proc:
+        try:
+            if proc.wait(timeout=timeout_duration) != 0 \
+                and print_output \
+                and error_msg is not None:
+                print(error_msg)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
 
 class ShellProcessExecutor:
     def __init__(self, print_output: bool = False, timeout_duration: int = 600) -> None:
         self.print_output = print_output
         self.timeout_duration = timeout_duration
+    
+    def _execute_shell_process(self, cmd_str: str, error_msg: str = None):
+        with subprocess.Popen(cmd_str, shell=True, start_new_session=True) as proc:
+            try:
+                if proc.wait(timeout=self.timeout_duration) != 0 \
+                    and self.print_output \
+                    and error_msg is not None:
+                    print(error_msg)
+            except subprocess.TimeoutExpired:
+                proc.kill()
 
 
-class OBabelLigandPreparation(ShellProcessExecutor):
+class PooledWorkerExecutor:
+    def __init__(self, num_workers=None, timeout_duration: int = 600):
+        if num_workers is None:
+            num_workers = multiprocessing.cpu_count()
+        self.pool = multiprocessing.Pool(num_workers)
+        self.timeout_duration = timeout_duration
+
+    def map(self, fn, iterable):
+        return self.pool.map_async(fn, iterable)
+
+    def starmap(self, fn, iterable):
+        return self.pool.starmap_async(fn, iterable)
+
+    def apply(self, fn):
+        return self.pool.apply_async(fn)
+
+    def close(self):
+        self.pool.close()
+
+    def join(self):
+        self.pool.join()
+
+
+class OBabelLigandPreparator(ShellProcessExecutor, PooledWorkerExecutor):
     """
         Using obabel command line to prepare ligand.
         Installation instructions at https://openbabel.org/docs/Installation/install.html
@@ -63,65 +113,75 @@ class OBabelLigandPreparation(ShellProcessExecutor):
         cmd_str = f'obabel -:"{smi}" -O "{ligand_path}" -h --gen3d'
         if not self.print_output:
             cmd_str += ' > /dev/null 2>&1'
-        with subprocess.Popen(cmd_str, shell=True, start_new_session=True) as proc:
-            try:
-                if proc.wait(timeout=self.timeout_duration) != 0 and self.print_output:
-                    print(f"Error preparing ligand: {smi}")
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        self._execute_shell_process(cmd_str, f"Error preparing ligand: {smi}")
 
 
-class AutoDockLigandPreparation(ShellProcessExecutor):
+class AutoDockLigandPreparator(ShellProcessExecutor):
     """
         Using AutoDock to prepare ligand (a python3 translated version).
         GitHub repository at https://github.com/Valdes-Tresanco-MS/AutoDockTools_py3
         Installation: "pip install git+https://github.com/Valdes-Tresanco-MS/AutoDockTools_py3"
     """
     def __call__(self, smi: str, ligand_path: str) -> None:
-        with subprocess.Popen(f'prepare_ligand4',
-        shell=True, start_new_session=True) as proc:
-            try:
-                proc.wait(timeout=self.timeout_duration)
-            except subprocess.TimeoutExpired:
-                proc.kill()
+        cmd_str = f'prepare_ligand4'
+        self._execute_shell_process(cmd_str, f"Error preparing ligand: {smi}")
 
-
-class MeekoLigandPreparation(ShellProcessExecutor):
+class MeekoLigandPreparator(ShellProcessExecutor):
     """
         Using Meeko to prepare ligand.
         GitHub repository: https://github.com/forlilab/Meeko
         Installation: "pip install meeko"
     """
-    def __init__(self, print_output: bool, timeout_duration: int = 600) -> None:
+    def __init__(self, print_output: bool, timeout_duration: int = None, n_workers: Union[int, None] = -1) -> None:
         super().__init__(print_output, timeout_duration)
         if not _meeko_available:
             raise Exception("Meeko package hasn't been installed.")
-
-    def __call__(self, smi: str, ligand_path: str) -> None:
-        mol = Chem.MolFromSmiles(smi)
-
-        # Add hydrogen and generate 3D coordinates
-        mol = Chem.AddHs(mol)
-        AllChem.EmbedMolecule(mol)
-        AllChem.MMFFOptimizeMolecule(mol)
-
-        w = Chem.SDWriter(f'{ligand_path}.sdf')
-        w.write(mol)
-        w.close()
-
-        cmd_str = f'mk_prepare_ligand.py -i {ligand_path}.sdf -o {ligand_path}'
-        if not self.print_output:
-            cmd_str += ' > /dev/null 2>&1'
-        with subprocess.Popen(cmd_str,
-        shell=True, start_new_session=True) as proc:
-            try:
-                if proc.wait(timeout=self.timeout_duration) != 0 and self.print_output:
-                    print(f"Error preparing ligand: {smi}")
-            except subprocess.TimeoutExpired:
-                proc.kill()
         
-        if os.path.isfile(f'{ligand_path}.sdf'):
-            os.remove(f'{ligand_path}.sdf')
+        if n_workers != -1:
+            self.pool_executor = PooledWorkerExecutor(n_workers, timeout_duration)
+        else:
+            self.pool_executor = None
+
+    def __call__(self, smi: Union[str, List[str]], ligand_path: Union[str, List[str]]) -> None:
+        if smi is type(str):
+            smi = [smi]
+        if ligand_path is type(str):
+            ligand_path = [ligand_path]
+        
+        if self.pool_executor is not None:
+            tmp = partial(self._prepare_ligand, print_output=self.print_output)
+            res = self.pool_executor.starmap(tmp, zip(smi, ligand_path))
+            res.wait()
+        else:
+            for i in range(len(smi)):
+                self._prepare_ligand(smi[i], ligand_path[i], self.print_output)
+    
+    @staticmethod
+    def _prepare_ligand(smi: str, ligand_path: str, print_output: bool = False) -> None:
+        """
+            Note: Potentially unsafe for concurrent application with batched docking.
+            Ensure unique ligands for preparation.
+        """
+        if not os.path.exists(ligand_path):
+            mol = Chem.MolFromSmiles(smi)
+
+            # Add hydrogen and generate 3D coordinates
+            mol = Chem.AddHs(mol)
+            AllChem.EmbedMolecule(mol)
+            AllChem.MMFFOptimizeMolecule(mol)
+
+            w = Chem.SDWriter(f'{ligand_path}.sdf')
+            w.write(mol)
+            w.close()
+
+            cmd_str = f'mk_prepare_ligand.py -i {ligand_path}.sdf -o {ligand_path}'
+            if not print_output:
+                cmd_str += ' > /dev/null 2>&1'
+            
+            execute_shell_process(cmd_str, f"Error preparing ligand: {smi}")
+            
+            if os.path.isfile(f'{ligand_path}.sdf'):
+                os.remove(f'{ligand_path}.sdf')
 
 
 class TimedProfiler:
@@ -162,9 +222,10 @@ class VinaDockingModule:
                  keep_output_file: bool = True,
                  keep_log_file: bool = True,
                  keep_config_file: bool = True,
-                 timeout_duration: int = 600,
-                 additional_vina_args: Dict[str, str] = None,
-                 ligand_preparation_fn: callable = OBabelLigandPreparation(),
+                 timeout_duration: int = 1000,
+                 additional_vina_args: Dict[str, str] = {},
+                 ligand_preparation_fn: callable = OBabelLigandPreparator(),
+                 n_workers: int = 1,
                  print_msgs: bool = False,
                  print_vina_output: bool = False,
                  debug: bool = False) -> None:
@@ -189,6 +250,8 @@ class VinaDockingModule:
             - additional_vina_args: Dictionary of additional Vina command arguments (e.g. {"cpu": "5"})
             - ligand_preparation_fn: Function to prepare molecule for docking. Should take the \
                 argument format (smiles string, ligand_path, timeout_duration)
+            - n_workers: Number of workers for preparing ligands. Only available in \
+                batched docking mode, and uses total number of CPUs if set to None.
             - print_msgs: Show Python print messages in console (True) or not (False)
             - print_vina_output: Show Vina docking output in console (True) or not (False)
             - debug: Profiling the Vina docking process and ligand preparation.
@@ -223,15 +286,18 @@ class VinaDockingModule:
 
         if len(size) != 3:
             raise Exception(f"size must contain 3 values, {size} was provided")
+
+        if not self.batch_docking_support and n_workers != 1:
+            raise Exception("Batched docking not enabled with this Vina command and n_workers != 1")
         
         if print_msgs and not self.logging_support:
             print("Log files are not supported with this Vina command")
         
         if print_msgs and self.batch_docking_support:
-            print("Batched docking is enabled, and logging is now disabled")
+            print("Batched docking is enabled; log and config files will not be saved")
             self.logging_support = False
         elif print_msgs and not self.batch_docking_support:
-            print("Batched docking is not supported with selected Vina version")
+            print("Batched docking is disabled; not supported with selected Vina version")
 
         self.vina_cmd = vina_cmd
         self.receptor_pdbqt_file = receptor_pdbqt_file
@@ -251,6 +317,7 @@ class VinaDockingModule:
         self.timeout_duration = timeout_duration
         self.additional_vina_args = additional_vina_args
         self.ligand_preparation_fn = ligand_preparation_fn  # should follow format (smiles string, ligand_path)
+        self.n_workers = n_workers
         self.print_msgs = print_msgs
         self.print_vina_output = print_vina_output
         self.debug = debug
@@ -258,15 +325,18 @@ class VinaDockingModule:
         if debug:
             self.preparation_profiler = TimedProfiler()
             self.docking_profiler = TimedProfiler()
+        
+        # TODO: may have to change current working directory (os.chdir()) back and forth depending on Vina version: use argument for that.
 
         os.makedirs(output_dir_path, exist_ok=True)
-        os.makedirs(config_dir_path, exist_ok=True)
         os.makedirs(ligand_dir_path, exist_ok=True)
         if self.logging_support:
             os.makedirs(log_dir_path, exist_ok=True)
         if self.batch_docking_support:
             os.makedirs(tmp_ligand_dir_path, exist_ok=True)
             os.makedirs(tmp_output_dir_path, exist_ok=True)
+        else:
+            os.makedirs(config_dir_path, exist_ok=True)
     
     def __call__(self, smi: Union[str, List[str]], redo_calculation: bool = False) -> List[Union[float, None]]:
         """
@@ -276,16 +346,18 @@ class VinaDockingModule:
         - redo_calculation: Force redo of ligand preparation, remake config file, and recalculate \
             binding affinity score.
         """
-        binding_scores = []
-        output_paths = []  # for batched docking
-
         if type(smi) is str:
             smi = [smi]
+        else:
+            smi = [Chem.MolToSmiles(Chem.MolFromSmiles(s), isomericSmiles=True, canonical=True) for s in smi]
+        
+        if self.batch_docking_support:
+            return self._batched_docking(smi)
+        else:
+            return self._docking(smi)
 
         for smi_str in smi:
-            # sanitize SMILES string to save as file name
-            ligand_name = smi_str.replace('(', '{').replace(')', '}').replace('\\', r'%5C').replace('/', r'%2F').replace('#', '%23')
-
+            
             # Get proper directory/file pathing
             if self.batch_docking_support:
                 tmp_ligand_path = self.tmp_ligand_dir_path + ligand_name + '.pdbqt'
@@ -391,6 +463,90 @@ class VinaDockingModule:
             if os.path.exists(self.tmp_config_file_path):
                 os.remove(self.tmp_config_file_path)
         return binding_scores
+
+    def _docking(self, smis: Iterable[str]):
+        ligand_name = sanitize_smi_name_for_file(smi)
+
+        ligand_path = self.ligand_dir_path + ligand_name + '.pdbqt'
+        output_path = self.output_dir_path + ligand_name + '_out.pdbqt'
+        config_path = self.config_dir_path + ligand_name + '.conf'
+        output_exists = os.path.exists(output_path)
+
+        if self.logging_support:
+            log_path = self.log_dir_path + ligand_name + '_log.txt'
+        else:
+            log_path = None
+
+    def _batched_docking(self, smis: Iterable[str]) -> List[Union[float, None]]:
+        tmp_ligand_path_fn = lambda smi: f"{self.tmp_ligand_dir_path}{sanitize_smi_name_for_file(smi)}.pdbqt"
+        ligand_path_fn = lambda smi: f"{self.ligand_dir_path}{sanitize_smi_name_for_file(smi)}.pdbqt"
+        output_path_fn = lambda smi: f"{self.output_dir_path}{sanitize_smi_name_for_file(smi)}_out.pdbqt"
+        tmp_output_path_fn = lambda smi: f"{self.tmp_output_dir_path}{sanitize_smi_name_for_file(smi)}_out.pdbqt"
+        
+        # not the fastest implementation, but safe if multiple experiments running at same time
+        overlap = [i for i in range(len(smis)) if os.path.exists(output_path_fn(smis[i]))]
+        ligand_paths = [ligand_path_fn(smis[i]) for i in range(len(smis)) if i not in overlap]
+        tmp_ligand_paths = [tmp_ligand_path_fn(smis[i]) for i in range(len(smis)) if i not in overlap]
+        if self.keep_output_file:
+            output_paths = [output_path_fn(smi) for smi in smis]
+        else:
+            output_paths = [output_path_fn(smis[i]) if i in overlap else tmp_output_path_fn(smis[i]) for i in range(len(smis))]
+
+        self._prepare_ligands(smis, ligand_paths, tmp_ligand_paths)
+        self._write_conf_file(self.tmp_config_file_path, 
+                              {"ligand_directory": self.tmp_ligand_dir_path,
+                               "output_directory": self.tmp_output_dir_path})
+
+        # Perform docking procedure
+        if self.debug:
+            self.docking_profiler.time_it(self._run_vina, self.tmp_config_file_path, None)
+        else:
+            self._run_vina(self.tmp_config_file_path, None)
+
+        # Remove temporary config file
+        if os.path.exists(self.tmp_config_file_path):
+            os.remove(self.tmp_config_file_path)
+        
+        # Move files from temporary to proper directory (or delete if redoing calculation)
+        if self.keep_ligand_file:
+            move_files_from_dir(self.tmp_ligand_dir_path, self.ligand_dir_path)
+        else:
+            delete_dir_contents(self.tmp_ligand_dir_path)
+
+        if self.keep_output_file:
+            move_files_from_dir(self.tmp_output_dir_path, self.output_dir_path)
+        else:
+            delete_dir_contents(self.tmp_output_dir_path)
+        
+        # Gather binding scores
+        binding_scores = []
+        for i in range(len(smis)):
+            binding_scores.append(self._get_output_score(output_paths[i]))
+        
+        return binding_scores
+    
+    def _prepare_ligands(self, smis: List[str],
+                               ligand_paths: List[str],
+                               tmp_ligand_paths: List[str] = None):
+        # Copying from ligand_paths to tmp_ligand_paths (batched docking)
+        if tmp_ligand_paths is not None:
+            for i in range(len(ligand_paths)):
+                if os.path.isfile(ligand_paths[i]):
+                    shutil.copy(ligand_paths[i], tmp_ligand_paths[i])
+                    if self.print_msgs:
+                        print(f'Ligand file: {ligand_paths[i]!r} already exists, copying to {tmp_ligand_paths[i]!r}')
+
+        # Perform ligand preparation and save to proper path (tmp/non-tmp ligand dir)
+        if tmp_ligand_paths is not None:
+            save_ligand_path = tmp_ligand_paths
+        else:
+            save_ligand_path = ligand_paths
+        
+        if self.debug:
+            self.preparation_profiler.time_it(self.ligand_preparation_fn, smis, save_ligand_path)
+        else:
+            self.ligand_preparation_fn(smis, save_ligand_path)
+
     
     @staticmethod
     def _get_output_score(output_path: str) -> Union[float, None]:
@@ -405,7 +561,7 @@ class VinaDockingModule:
         except FileNotFoundError:
             return None
     
-    def _default_conf_str(self):
+    def _write_conf_file(self, config_file_path: str, args: Dict[str, str] = {}):
         conf = f'receptor = {self.receptor_pdbqt_file}\n' + \
                f'center_x = {self.center_pos[0]}\n' + \
                f'center_y = {self.center_pos[1]}\n' + \
@@ -414,9 +570,15 @@ class VinaDockingModule:
                f'size_y = {self.size[1]}\n' + \
                f'size_z = {self.size[2]}\n'
 
-        if self.additional_vina_args is not None:
-                for k, v in self.additional_vina_args.items():
-                    conf += f"{str(k)} = {str(v)} \n"
+        for k, v in self.additional_vina_args.items():
+            conf += f"{str(k)} = {str(v)} \n"
+        
+        for k, v in args.items():
+            conf += f"{str(k)} = {str(v)} \n"
+        
+        with open(config_file_path, 'w') as f:
+            f.write(conf)
+
         return conf
     
     def _run_vina(self, config_path, log_path):
@@ -459,14 +621,34 @@ class VinaDockingModule:
             shutil.rmtree(self.output_dir_path)
 
 
+def test_preparator():
+    preparation_fn = MeekoLigandPreparator(False, timeout_duration, n_workers=multiprocessing.cpu_count())
+    smiles = data['smiles'].iloc[:10000].tolist()
+    ligand_files = [f"./ligands/{sanitize_smi_name_for_file(x)}.pdbqt" for x in smiles]
+    preparation_fn(smiles, ligand_files)
 
 if __name__ == "__main__":
-    data = pd.read_csv('zinc250k_first_1k.csv')
+    data = data = MolGen(name = 'ZINC').get_data()
     timeout_duration = 600
 
-    delete_all()
+    preparation_fn = MeekoLigandPreparator(False, timeout_duration, n_workers=multiprocessing.cpu_count())
 
-    preparation_fn = MeekoLigandPreparation(timeout_duration)
+    #delete_all()
+
+    # QuickVina2-GPU 2.1
+    docking_module = VinaDockingModule("/home/nick/Desktop/GPU-Docking/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina2-GPU-2-1",
+                                       "./advina_module/protein_files/6rqu.pdbqt",
+                                       [7.750, -14.556, 6.747],
+                                       [20, 20, 20],
+                                       print_msgs=True,
+                                       debug=True,
+                                       ligand_preparation_fn=preparation_fn,
+                                       timeout_duration=timeout_duration,
+                                       additional_vina_args={"thread": "8000",
+                                                             "opencl_binary_path" : "/home/nick/Desktop/GPU-Docking/Vina-GPU-2.1/QuickVina2-GPU-2.1"})
+    print(docking_module(data['smiles'].iloc[:1000]))
+    docking_module.delete_tmp_files()
+    exit(1)
 
     docking_module = VinaDockingModule("./qvina2.1",
                                        "./advina_module/protein_files/6rqu.pdbqt",
@@ -480,27 +662,8 @@ if __name__ == "__main__":
                                        debug=True,
                                        ligand_preparation_fn=preparation_fn,
                                        timeout_duration=timeout_duration)
-    print(docking_module(data['smiles'].iloc[:10]))
+    print(docking_module(data['smiles'].iloc[:1]))
 
-    delete_all()
-
-    # QuickVina2-GPU 2.1
-    docking_module = VinaDockingModule("/home/nick/Desktop/GPU-Docking/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina2-GPU-2-1",
-                                       "./advina_module/protein_files/6rqu.pdbqt",
-                                       [7.750, -14.556, 6.747],
-                                       [20, 20, 20],
-                                       keep_ligand_file=False,
-                                       keep_config_file=False,
-                                       keep_log_file=False,
-                                       keep_output_file=False,
-                                       print_msgs=True,
-                                       debug=True,
-                                       ligand_preparation_fn=preparation_fn,
-                                       timeout_duration=timeout_duration,
-                                       additional_vina_args={"thread": "8000",
-                                                             "opencl_binary_path" : "/home/nick/Desktop/GPU-Docking/Vina-GPU-2.1/QuickVina2-GPU-2.1"})
-    print(docking_module(data['smiles'].iloc[:10]))
-    exit(1)
     with tqdm(total=1000) as pbar:
         for smi in data.iloc[:1000]['smiles']:
             docking_module(smi)
