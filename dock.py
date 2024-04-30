@@ -9,6 +9,7 @@ from typing import Dict, Iterable, List, Union
 from tqdm import tqdm
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from tdc.generation import MolGen
 from functools import partial
 
 try:
@@ -32,6 +33,9 @@ def delete_all():
         shutil.rmtree('./logs/')
     if os.path.exists('./outputs/'):
         shutil.rmtree('./outputs/')
+
+def make_dir(rel_path, *args, **kwargs):
+    os.makedirs(os.path.abspath(rel_path), *args, **kwargs)
 
 def sanitize_smi_name_for_file(smi: str):
     return smi.replace('(', '{').replace(')', '}').replace('\\', r'%5C').replace('/', r'%2F').replace('#', '%23')
@@ -60,6 +64,15 @@ def execute_shell_process(cmd_str: str, error_msg: str = None, print_output: boo
                 print(error_msg)
         except subprocess.TimeoutExpired:
             proc.kill()
+
+def split_list(lst, n):
+    """Split a list into n equal parts, with any remainder added to the last split."""
+    if n <= 0:
+        raise ValueError("Number of splits (n) must be a positive integer.")
+    
+    quotient, remainder = divmod(len(lst), n)
+    splits = [lst[i * quotient + min(i, remainder):(i + 1) * quotient + min(i + 1, remainder)] for i in range(n)]
+    return splits
 
 
 class ShellProcessExecutor:
@@ -214,7 +227,7 @@ class TimedProfiler:
         return self._average
 
 
-class VinaDockingModule:
+class VinaDocking:
     def __init__(self, 
                  vina_cmd: str,
                  receptor_pdbqt_file: str,
@@ -235,6 +248,7 @@ class VinaDockingModule:
                  additional_vina_args: Dict[str, str] = {},
                  ligand_preparation_fn: callable = OBabelLigandPreparator(),
                  vina_cwd: str = None,
+                 gpu_ids: Union[int, List[int]] = 0,
                  print_msgs: bool = False,
                  print_vina_output: bool = False,
                  debug: bool = False) -> None:
@@ -261,6 +275,8 @@ class VinaDockingModule:
                 argument format (smiles strings, ligand paths)
             - vina_cwd: Change current working directory of Vina shell (sometimes needed for GPU versions \
                 and incorrect openCL pathing)
+            - gpu_ids: GPU ids to use for multi-GPU docking (0 is default for single-GPU nodes). If None, \
+                use all GPUs.
             - print_msgs: Show Python print messages in console (True) or not (False)
             - print_vina_output: Show Vina docking output in console (True) or not (False)
             - debug: Profiling the Vina docking process and ligand preparation.
@@ -270,6 +286,7 @@ class VinaDockingModule:
         try:
             with subprocess.Popen(f"{vina_cmd} --help_advanced",
                     stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
                     shell=True) as proc:
                 if proc.wait(timeout=timeout_duration) == 0:
                     result = proc.stdout.read()
@@ -283,7 +300,7 @@ class VinaDockingModule:
                         if "--ligand_directory" in result:
                             self.batch_docking_support = True
                 else:
-                    raise Exception(f"Vina command '{vina_cmd}' returned unsuccessfully.")
+                    raise Exception(f"Vina command '{vina_cmd}' returned unsuccessfully: {proc.stderr.read()}")
         except subprocess.TimeoutExpired:
             proc.kill()
             self.logging_support = False
@@ -307,6 +324,19 @@ class VinaDockingModule:
         elif print_msgs and not self.batch_docking_support:
             print("Batched docking is disabled; not supported with selected Vina version")
 
+        if gpu_ids is None:
+            with subprocess.Popen(f"nvidia-smi --list-gpus",
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    shell=True) as proc:
+                if proc.wait(timeout=timeout_duration) == 0:
+                    gpu_ids = []
+                    out = proc.stdout.read().decode('ascii')
+                    pattern = r"GPU (\d+):"
+                    gpu_ids = [int(x) for x in re.findall(pattern, out)]
+                else:
+                    raise Exception(f"Command 'nvidia-smi --list-gpus' returned unsuccessfully: {proc.stderr.read()}")
+
         self.vina_cmd = vina_cmd
         self.receptor_pdbqt_file = os.path.abspath(receptor_pdbqt_file)
         self.center_pos = center_pos
@@ -326,33 +356,32 @@ class VinaDockingModule:
         self.additional_vina_args = additional_vina_args
         self.ligand_preparation_fn = ligand_preparation_fn  # should follow format (smiles string, ligand_path)
         self.vina_cwd = vina_cwd
+        self.gpu_ids = gpu_ids
         self.print_msgs = print_msgs
         self.print_vina_output = print_vina_output
         self.debug = debug
+
+        if type(self.gpu_ids) is int:
+            self.gpu_ids = [self.gpu_ids]
 
         if debug:
             self.preparation_profiler = TimedProfiler()
             self.docking_profiler = TimedProfiler()
         
-        # TODO: may have to change current working directory (os.chdir()) back and forth depending on Vina version: use argument for that.
-
-        os.makedirs(output_dir_path, exist_ok=True)
-        os.makedirs(ligand_dir_path, exist_ok=True)
+        make_dir(output_dir_path, exist_ok=True)
+        make_dir(ligand_dir_path, exist_ok=True)
         if self.logging_support and self.keep_log_file:
-            os.makedirs(log_dir_path, exist_ok=True)
+            make_dir(log_dir_path, exist_ok=True)
         if self.batch_docking_support:
-            os.makedirs(tmp_ligand_dir_path, exist_ok=True)
-            os.makedirs(tmp_output_dir_path, exist_ok=True)
+            pass
         else:
-            os.makedirs(config_dir_path, exist_ok=True)
+            make_dir(config_dir_path, exist_ok=True)
     
-    def __call__(self, smi: Union[str, List[str]], redo_calculation: bool = False) -> List[Union[float, None]]:
+    def __call__(self, smi: Union[str, List[str]]) -> List[Union[float, None]]:
         """
         Parameters:
         - smi: SMILES strings to perform docking. A single string activates single-ligand docking mode, while \
             multiple strings utilizes batched docking (if Vina version allows it).
-        - redo_calculation: Force redo of ligand preparation, remake config file, and recalculate \
-            binding affinity score.
         """
         if type(smi) is str:
             smi = [smi]
@@ -415,6 +444,8 @@ class VinaDockingModule:
     def _batched_docking(self, smis: Iterable[str]) -> List[Union[float, None]]:
         # TODO: GPU versions can be made faster by better pipelining (prepare x number of molecules on CPU while docking at same time on GPU)
 
+        self._make_tmp_files()
+
         tmp_ligand_path_fn = lambda smi: os.path.abspath(f"{self.tmp_ligand_dir_path}{sanitize_smi_name_for_file(smi)}.pdbqt")
         ligand_path_fn = lambda smi: os.path.abspath(f"{self.ligand_dir_path}{sanitize_smi_name_for_file(smi)}.pdbqt")
         output_path_fn = lambda smi: os.path.abspath(f"{self.output_dir_path}{sanitize_smi_name_for_file(smi)}_out.pdbqt")
@@ -430,35 +461,50 @@ class VinaDockingModule:
             output_paths = [output_path_fn(smis[i]) if i in overlap else tmp_output_path_fn(smis[i]) for i in range(len(smis))]
 
         self._prepare_ligands(smis, ligand_paths, tmp_ligand_paths)
-        self._write_conf_file(self.tmp_config_file_path, 
-                              {"ligand_directory": self.tmp_ligand_dir_path,
-                               "output_directory": self.tmp_output_dir_path})
 
-        # Perform docking procedure
-        if self.debug:
-            self.docking_profiler.time_it(self._run_vina, self.tmp_config_file_path, None)
-        else:
-            self._run_vina(self.tmp_config_file_path, None)
+        # Multi-GPU docking: move ligands to the gpu_id directories
+        split_tmp_ligand_paths = split_list(tmp_ligand_paths, len(self.gpu_ids))
+        for i in range(len(self.gpu_ids)):
+            gpu_id = self.gpu_ids[i]
+            self._write_conf_file(f"{self.tmp_config_file_path}_{gpu_id}",
+                                {"ligand_directory": f"{self.tmp_ligand_dir_path}/{gpu_id}/",
+                                 "output_directory": f"{self.tmp_output_dir_path}/{gpu_id}/"})
+            for tmp_ligand_file in split_tmp_ligand_paths[i]:
+                shutil.move(tmp_ligand_file, os.path.abspath(f"{self.tmp_ligand_dir_path}/{gpu_id}/"))
 
-        # Remove temporary config file
-        if os.path.exists(self.tmp_config_file_path):
-            os.remove(self.tmp_config_file_path)
+        # Perform docking procedure(s)
+        for gpu_id in self.gpu_ids:
+            if self.debug:
+                self.docking_profiler.time_it(self._run_vina, f"{self.tmp_config_file_path}_{gpu_id}", f"CUDA_VISIBLE_DEVICES={gpu_id} ")
+            else:
+                self._run_vina(f"{self.tmp_config_file_path}_{gpu_id}", f"CUDA_VISIBLE_DEVICES={gpu_id} ")
+
+        # Remove temporary config file(s)
+        for gpu_id in self.gpu_ids:
+            if os.path.exists(f"{self.tmp_config_file_path}_{gpu_id}"):
+                os.remove(f"{self.tmp_config_file_path}_{gpu_id}")
         
         # Move files from temporary to proper directory (or delete if redoing calculation)
         if self.keep_ligand_file:
-            move_files_from_dir(self.tmp_ligand_dir_path, self.ligand_dir_path)
+            for gpu_id in self.gpu_ids:
+                move_files_from_dir(f"{self.tmp_ligand_dir_path}/{gpu_id}/", self.ligand_dir_path)
         else:
-            delete_dir_contents(self.tmp_ligand_dir_path)
+            for gpu_id in self.gpu_ids:
+                delete_dir_contents(f"{self.tmp_ligand_dir_path}/{gpu_id}/")
 
         if self.keep_output_file:
-            move_files_from_dir(self.tmp_output_dir_path, self.output_dir_path)
+            for gpu_id in self.gpu_ids:
+                move_files_from_dir(f"{self.tmp_output_dir_path}/{gpu_id}/", self.output_dir_path)
         else:
-            delete_dir_contents(self.tmp_output_dir_path)
+            for gpu_id in self.gpu_ids:
+                delete_dir_contents(f"{self.tmp_output_dir_path}/{gpu_id}/")
         
         # Gather binding scores
         binding_scores = []
         for i in range(len(smis)):
             binding_scores.append(self._get_output_score(output_paths[i]))
+        
+        self._delete_tmp_files()
         
         return binding_scores
     
@@ -483,7 +529,6 @@ class VinaDockingModule:
             return self.preparation_profiler.time_it(self.ligand_preparation_fn, smis, save_ligand_path)
         else:
             return self.ligand_preparation_fn(smis, save_ligand_path)
-
     
     @staticmethod
     def _get_output_score(output_path: str) -> Union[float, None]:
@@ -518,9 +563,15 @@ class VinaDockingModule:
 
         return conf
     
-    def _run_vina(self, config_path, log_path):
+    def _run_vina(self, config_path, log_path, vina_cmd_prefix: str = None):
         try:
-            cmd_str = f"{self.vina_cmd} --config {config_path}"
+            if vina_cmd_prefix is not None:
+                cmd_str = f"{vina_cmd_prefix}"
+            else:
+                cmd_str = ""
+
+            cmd_str += f"{self.vina_cmd} --config {config_path}"
+
             if self.logging_support and log_path is not None:
                 cmd_str += f" --log {log_path}"
             if not self.print_vina_output:
@@ -531,7 +582,7 @@ class VinaDockingModule:
         except subprocess.TimeoutExpired:
             proc.kill()
     
-    def delete_tmp_files(self):
+    def _delete_tmp_files(self):
         if os.path.exists(self.tmp_config_file_path):
             os.remove(self.tmp_config_file_path)
         
@@ -540,10 +591,19 @@ class VinaDockingModule:
         
         if os.path.exists(self.tmp_output_dir_path):
             shutil.rmtree(self.tmp_output_dir_path)
+    
+    def _make_tmp_files(self):
+        # make temporary ligand and output directories
+        make_dir(self.tmp_ligand_dir_path, exist_ok=True)
+        make_dir(self.tmp_output_dir_path, exist_ok=True)
+
+        # Multi-GPU: multiple ligand directories
+        for gpu_id in self.gpu_ids:
+            make_dir(f"{self.tmp_ligand_dir_path}/{gpu_id}/", exist_ok=True)
+            make_dir(f"{self.tmp_output_dir_path}/{gpu_id}/", exist_ok=True)
         
-    def delete_files(self, include_tmp_files: bool = True):
-        if include_tmp_files:
-            self.delete_tmp_files()
+    def delete_files(self):
+        self._delete_tmp_files()
         
         if os.path.exists(self.ligand_dir_path):
             shutil.rmtree(self.ligand_dir_path)
@@ -572,7 +632,7 @@ if __name__ == "__main__":
 
     delete_all()
 
-    docking_module = VinaDockingModule("/home/nick/Desktop/MolDocking/QuickVina2-GPU/QuickVina2-GPU",
+    docking_module = VinaDocking("/home/nick/Desktop/MolDocking/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina2-GPU-2-1",
                                        "advina_module/protein_files/6rqu.pdbqt",
                                        [7.750, -14.556, 6.747],
                                        [20, 20, 20],
@@ -580,11 +640,13 @@ if __name__ == "__main__":
                                        keep_config_file=True,
                                        keep_log_file=True,
                                        keep_output_file=True,
-                                       print_vina_output=True,
+                                       print_vina_output=False,
                                        print_msgs=True,
                                        debug=True,
                                        ligand_preparation_fn=preparation_fn,
                                        timeout_duration=timeout_duration,
-                                       vina_cwd='/home/nick/Desktop/MolDocking/QuickVina2-GPU/')
-    print(docking_module(data['smiles'].iloc[:5]))
-
+                                       gpu_ids=None,
+                                       additional_vina_args={"thread": "5000",
+                                                             "opencl_binary_path": "/home/nick/Desktop/MolDocking/Vina-GPU-2.1/QuickVina2-GPU-2.1"})
+    print(docking_module(data['smiles'].iloc[:10]), docking_module.docking_profiler.get_average(), docking_module.preparation_profiler.get_average())
+    exit(1)
