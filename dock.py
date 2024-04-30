@@ -473,16 +473,18 @@ class VinaDocking:
                 shutil.move(tmp_ligand_file, os.path.abspath(f"{self.tmp_ligand_dir_path}/{gpu_id}/"))
 
         # Perform docking procedure(s)
-        for gpu_id in self.gpu_ids:
-            if self.debug:
-                self.docking_profiler.time_it(self._run_vina, f"{self.tmp_config_file_path}_{gpu_id}", f"CUDA_VISIBLE_DEVICES={gpu_id} ")
-            else:
-                self._run_vina(f"{self.tmp_config_file_path}_{gpu_id}", f"CUDA_VISIBLE_DEVICES={gpu_id} ")
+        # TODO: make not block on _run_vina call here.
+        config_paths = [os.path.abspath(f"{self.tmp_config_file_path}_{gpu_id}") for gpu_id in self.gpu_ids]
+        vina_cmd_prefixes = [f"CUDA_VISIBLE_DEVICES={gpu_id} " for gpu_id in self.gpu_ids]
+        if self.debug:
+            self.docking_profiler.time_it(self._run_vina, config_paths, vina_cmd_prefixes=vina_cmd_prefixes, blocking=False)
+        else:
+            self._run_vina(config_paths, vina_cmd_prefixes=vina_cmd_prefixes, blocking=False)
 
         # Remove temporary config file(s)
-        for gpu_id in self.gpu_ids:
-            if os.path.exists(f"{self.tmp_config_file_path}_{gpu_id}"):
-                os.remove(f"{self.tmp_config_file_path}_{gpu_id}")
+        for config_path in config_paths:
+            if os.path.exists(config_path):
+                os.remove(config_path)
         
         # Move files from temporary to proper directory (or delete if redoing calculation)
         if self.keep_ligand_file:
@@ -563,24 +565,44 @@ class VinaDocking:
 
         return conf
     
-    def _run_vina(self, config_path, log_path, vina_cmd_prefix: str = None):
-        try:
-            if vina_cmd_prefix is not None:
-                cmd_str = f"{vina_cmd_prefix}"
+    def _run_vina(self, config_paths: List[List[str]], log_paths: List[List[str]] = None, vina_cmd_prefixes: List[str] = None, blocking: bool = True):
+        """
+            Runs Vina docking in separate shell process(es).
+        """
+        if log_paths is not None:
+            assert len(config_paths) == len(log_paths)
+        if vina_cmd_prefixes is not None:
+            assert len(config_paths) == len(vina_cmd_prefixes)
+        procs = []
+
+        for i in range(len(config_paths)):
+            if vina_cmd_prefixes[i] is not None:
+                cmd_str = vina_cmd_prefixes[i]
             else:
                 cmd_str = ""
 
-            cmd_str += f"{self.vina_cmd} --config {config_path}"
+            cmd_str += f"{self.vina_cmd} --config {config_paths[i]}"
 
-            if self.logging_support and log_path is not None:
-                cmd_str += f" --log {log_path}"
+            if self.logging_support and log_paths[i] is not None:
+                cmd_str += f" --log {log_paths[i]}"
             if not self.print_vina_output:
                 cmd_str += " > /dev/null 2>&1"
 
-            with subprocess.Popen(cmd_str, shell=True, start_new_session=True, cwd=self.vina_cwd) as proc:
-                proc.wait(timeout=self.timeout_duration)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+            proc = subprocess.Popen(cmd_str, shell=True, start_new_session=True, cwd=self.vina_cwd)
+            if blocking:
+                try:
+                    proc.wait(timeout=self.timeout_duration)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            else:
+                procs.append(proc)
+        
+        if not blocking:
+            for proc in procs:
+                try:
+                    proc.wait(timeout=self.timeout_duration)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
     
     def _delete_tmp_files(self):
         if os.path.exists(self.tmp_config_file_path):
