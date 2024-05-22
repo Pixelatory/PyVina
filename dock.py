@@ -3,20 +3,10 @@ import subprocess
 import re
 import time
 import shutil
-import multiprocessing
 
 from typing import Dict, Iterable, List, Union
-from tqdm import tqdm
 from rdkit import Chem
-from rdkit.Chem import AllChem
-from tdc.generation import MolGen
-from functools import partial
-
-try:
-    import meeko
-    _meeko_available = True
-except ImportError:
-    _meeko_available = False
+import pyvina.ligand_preparators
 
 
 def delete_all():
@@ -55,16 +45,6 @@ def delete_dir_contents(dir_path: str):
         elif os.path.isdir(item_path):
             shutil.rmtree(item_path)
 
-def execute_shell_process(cmd_str: str, error_msg: str = None, print_output: bool = False, timeout_duration: int = None) -> None:
-    with subprocess.Popen(cmd_str, shell=True, start_new_session=True) as proc:
-        try:
-            if proc.wait(timeout=timeout_duration) != 0 \
-                and print_output \
-                and error_msg is not None:
-                print(error_msg)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-
 def split_list(lst, n):
     """Split a list into n equal parts, with any remainder added to the last split."""
     if n <= 0:
@@ -73,136 +53,6 @@ def split_list(lst, n):
     quotient, remainder = divmod(len(lst), n)
     splits = [lst[i * quotient + min(i, remainder):(i + 1) * quotient + min(i + 1, remainder)] for i in range(n)]
     return splits
-
-
-class ShellProcessExecutor:
-    def __init__(self, print_output: bool = False, timeout_duration: int = 600) -> None:
-        self.print_output = print_output
-        self.timeout_duration = timeout_duration
-    
-    def _execute_shell_process(self, cmd_str: str, error_msg: str = None):
-        with subprocess.Popen(cmd_str, shell=True, start_new_session=True) as proc:
-            try:
-                if proc.wait(timeout=self.timeout_duration) != 0 \
-                    and self.print_output \
-                    and error_msg is not None:
-                    print(error_msg)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-
-
-class PooledWorkerExecutor:
-    def __init__(self, num_workers=None, timeout_duration: int = 600):
-        if num_workers is None:
-            num_workers = multiprocessing.cpu_count()
-        self.pool = multiprocessing.Pool(num_workers)
-        self.timeout_duration = timeout_duration
-
-    def map(self, fn, iterable):
-        return self.pool.map_async(fn, iterable)
-
-    def starmap(self, fn, iterable):
-        return self.pool.starmap_async(fn, iterable)
-
-    def apply(self, fn):
-        return self.pool.apply_async(fn)
-
-    def close(self):
-        self.pool.close()
-
-    def join(self):
-        self.pool.join()
-
-
-class OBabelLigandPreparator(ShellProcessExecutor, PooledWorkerExecutor):
-    """
-        Using obabel command line to prepare ligand.
-        Installation instructions at https://openbabel.org/docs/Installation/install.html
-    """
-    def __call__(self, smi: str, ligand_path: str) -> None:
-        cmd_str = f'obabel -:"{smi}" -O "{ligand_path}" -h --gen3d'
-        if not self.print_output:
-            cmd_str += ' > /dev/null 2>&1'
-        self._execute_shell_process(cmd_str, f"Error preparing ligand: {smi}")
-
-
-class AutoDockLigandPreparator(ShellProcessExecutor):
-    """
-        Using AutoDock to prepare ligand (a python3 translated version).
-        GitHub repository at https://github.com/Valdes-Tresanco-MS/AutoDockTools_py3
-        Installation: "pip install git+https://github.com/Valdes-Tresanco-MS/AutoDockTools_py3"
-    """
-    def __call__(self, smi: str, ligand_path: str) -> None:
-        cmd_str = f'prepare_ligand4'
-        self._execute_shell_process(cmd_str, f"Error preparing ligand: {smi}")
-
-
-class MeekoLigandPreparator(ShellProcessExecutor):
-    """
-        Using Meeko to prepare ligand.
-        GitHub repository: https://github.com/forlilab/Meeko
-        Installation: "pip install meeko"
-    """
-    def __init__(self, print_output: bool, timeout_duration: int = None, n_workers: Union[int, None] = -1) -> None:
-        super().__init__(print_output, timeout_duration)
-        if not _meeko_available:
-            raise Exception("Meeko package hasn't been installed.")
-        
-        if n_workers != -1:
-            self.pool_executor = PooledWorkerExecutor(n_workers, timeout_duration)
-        else:
-            self.pool_executor = None
-
-    def __call__(self, smi: Union[str, List[str]], ligand_path: Union[str, List[str]]) -> List[bool]:
-        """
-            returns: List containing whether new ligand file was created (True) or is already existing (False)
-        """
-        if smi is type(str):
-            smi = [smi]
-        if ligand_path is type(str):
-            ligand_path = [ligand_path]
-        
-        if self.pool_executor is not None:
-            tmp = partial(self._prepare_ligand, print_output=self.print_output)
-            res = self.pool_executor.starmap(tmp, zip(smi, ligand_path))
-            return res.get()
-        else:
-            res = []
-            for i in range(len(smi)):
-                res.append(self._prepare_ligand(smi[i], ligand_path[i], self.print_output))
-            return res
-    
-    @staticmethod
-    def _prepare_ligand(smi: str, ligand_path: str, print_output: bool = False) -> bool:
-        """
-            Note: Potentially unsafe for concurrent application with batched docking.
-            Ensure unique ligands for preparation.
-
-            returns: True if new ligand file was produced, False if ligand file already exists
-        """
-        if not os.path.exists(ligand_path):
-            mol = Chem.MolFromSmiles(smi)
-
-            # Add hydrogen and generate 3D coordinates
-            mol = Chem.AddHs(mol)
-            AllChem.EmbedMolecule(mol)
-            AllChem.MMFFOptimizeMolecule(mol)
-
-            w = Chem.SDWriter(f'{ligand_path}.sdf')
-            w.write(mol)
-            w.close()
-
-            cmd_str = f'mk_prepare_ligand.py -i {ligand_path}.sdf -o {ligand_path}'
-            if not print_output:
-                cmd_str += ' > /dev/null 2>&1'
-            
-            execute_shell_process(cmd_str, f"Error preparing ligand: {smi}")
-            
-            if os.path.isfile(f'{ligand_path}.sdf'):
-                os.remove(f'{ligand_path}.sdf')
-            
-            return True
-        return False
 
 
 class TimedProfiler:
@@ -246,7 +96,7 @@ class VinaDocking:
                  keep_config_file: bool = True,
                  timeout_duration: int = 1000,
                  additional_vina_args: Dict[str, str] = {},
-                 ligand_preparation_fn: callable = OBabelLigandPreparator(),
+                 ligand_preparation_fn: callable = pyvina.ligand_preparators.MeekoLigandPreparator(False),
                  vina_cwd: str = None,
                  gpu_ids: Union[int, List[int]] = 0,
                  print_msgs: bool = False,
@@ -282,7 +132,8 @@ class VinaDocking:
             - debug: Profiling the Vina docking process and ligand preparation.
         """
 
-        # Check if certain docking aspects are supported (has vina command arguments e.g. '--log')
+        # Check if certain docking aspects are supported, such as logging and batched docking
+        # (has vina command arguments e.g. '--log')
         try:
             with subprocess.Popen(f"{vina_cmd} --help_advanced",
                     stdout=subprocess.PIPE,
@@ -297,7 +148,7 @@ class VinaDocking:
 
                         if "--log" in result:
                             self.logging_support = True
-                        if "--ligand_directory" in result:
+                        if "--ligand_directory" and "--output_directory" in result:
                             self.batch_docking_support = True
                 else:
                     raise Exception(f"Vina command '{vina_cmd}' returned unsuccessfully: {proc.stderr.read()}")
@@ -324,18 +175,33 @@ class VinaDocking:
         elif print_msgs and not self.batch_docking_support:
             print("Batched docking is disabled; not supported with selected Vina version")
 
+        # Getting all available GPU ids
+        with subprocess.Popen(f"nvidia-smi --list-gpus",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                shell=True) as proc:
+            if proc.wait(timeout=timeout_duration) == 0:
+                out = proc.stdout.read().decode('ascii')
+                pattern = r"GPU (\d+):"
+                available_gpu_ids = [int(x) for x in re.findall(pattern, out)]
+            else:
+                raise Exception(f"Command 'nvidia-smi --list-gpus' returned unsuccessfully: {proc.stderr.read()}")
+        
+        # Checking for incorrect GPU id input
         if gpu_ids is None:
-            with subprocess.Popen(f"nvidia-smi --list-gpus",
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    shell=True) as proc:
-                if proc.wait(timeout=timeout_duration) == 0:
-                    gpu_ids = []
-                    out = proc.stdout.read().decode('ascii')
-                    pattern = r"GPU (\d+):"
-                    gpu_ids = [int(x) for x in re.findall(pattern, out)]
-                else:
-                    raise Exception(f"Command 'nvidia-smi --list-gpus' returned unsuccessfully: {proc.stderr.read()}")
+            gpu_ids = available_gpu_ids
+        elif type(gpu_ids) is int:
+            if gpu_ids in available_gpu_ids:
+                gpu_ids = [self.gpu_ids]
+            else:
+                raise Exception(f"Unknown GPU id: {gpu_ids}")
+        else:
+            unknown_gpu_ids = []
+            for gpu_id in gpu_ids:
+                if gpu_id not in available_gpu_ids:
+                    unknown_gpu_ids.append(gpu_id)
+            if len(unknown_gpu_ids) > 0:
+                raise Exception(f"Unknown GPU id(s): {unknown_gpu_ids}")
 
         self.vina_cmd = vina_cmd
         self.receptor_pdbqt_file = os.path.abspath(receptor_pdbqt_file)
@@ -361,21 +227,9 @@ class VinaDocking:
         self.print_vina_output = print_vina_output
         self.debug = debug
 
-        if type(self.gpu_ids) is int:
-            self.gpu_ids = [self.gpu_ids]
-
         if debug:
             self.preparation_profiler = TimedProfiler()
             self.docking_profiler = TimedProfiler()
-        
-        make_dir(output_dir_path, exist_ok=True)
-        make_dir(ligand_dir_path, exist_ok=True)
-        if self.logging_support and self.keep_log_file:
-            make_dir(log_dir_path, exist_ok=True)
-        if self.batch_docking_support:
-            pass
-        else:
-            make_dir(config_dir_path, exist_ok=True)
     
     def __call__(self, smi: Union[str, List[str]]) -> List[Union[float, None]]:
         """
@@ -385,9 +239,10 @@ class VinaDocking:
         """
         if type(smi) is str:
             smi = [smi]
-        else:
-            smi = [Chem.MolToSmiles(Chem.MolFromSmiles(s), isomericSmiles=True, canonical=True) for s in smi]
+        smi = [Chem.MolToSmiles(Chem.MolFromSmiles(s), isomericSmiles=True, canonical=True) for s in smi]
         
+        self._make_dirs()
+
         if self.batch_docking_support:
             return self._batched_docking(smi)
         else:
@@ -399,7 +254,8 @@ class VinaDocking:
         config_path_fn = lambda smi: os.path.abspath(f"{self.config_dir_path}{sanitize_smi_name_for_file(smi)}.conf")
         log_path_fn = lambda smi: os.path.abspath(f"{self.log_dir_path}{sanitize_smi_name_for_file(smi)}_log.txt")
 
-        # NOTE 99% sure this implementation will give unnoticeable parallelism errors if keep_output_file is False so beware
+        # NOTE 99% sure this implementation will give unnoticeable parallelism errors if keep_output_file is False and running multiple experiments simultaneously so beware
+        # NOTE e.g. 2 experiments a and b, and a writes output, and b thinks binding output exists (it does temporarily). a then deletes output, b goes to read output and it's no longer there (returns None binding score)
         # NOTE solution: save output to tmp folder and then move to main output folder
         overlap = [i for i in range(len(smis)) if os.path.exists(output_path_fn(smis[i]))]
         ligand_paths = [ligand_path_fn(smis[i]) for i in range(len(smis)) if i not in overlap]
@@ -413,7 +269,7 @@ class VinaDocking:
             new_ligand_files = self.preparation_profiler.time_it(self._prepare_ligands, smis, ligand_paths)
         else:
             new_ligand_files = self._prepare_ligands(smis, ligand_paths)
-
+        
         for i in range(len(ligand_paths)):
             self._write_conf_file(config_paths[i], args={"ligand": ligand_paths[i], "out": output_paths_no_overlap[i]})
 
@@ -423,9 +279,9 @@ class VinaDocking:
                 log_path = None
 
             if self.debug:
-                self.docking_profiler.time_it(self._run_vina, config_paths[i], log_path)
+                self.docking_profiler.time_it(self._run_vina, [config_paths[i]], [log_path])
             else:
-                self._run_vina(config_paths[i], log_path)
+                self._run_vina([config_paths[i]], [log_path])
         
         binding_scores = []
         for output_path in output_paths:
@@ -464,27 +320,28 @@ class VinaDocking:
 
         # Multi-GPU docking: move ligands to the gpu_id directories
         split_tmp_ligand_paths = split_list(tmp_ligand_paths, len(self.gpu_ids))
+        tmp_config_file_paths = []
         for i in range(len(self.gpu_ids)):
             gpu_id = self.gpu_ids[i]
-            self._write_conf_file(f"{self.tmp_config_file_path}_{gpu_id}",
+            tmp_config_file_path = f"{self.tmp_config_file_path}_{gpu_id}"
+            tmp_config_file_paths.append(tmp_config_file_path)
+            self._write_conf_file(tmp_config_file_path,
                                 {"ligand_directory": f"{self.tmp_ligand_dir_path}/{gpu_id}/",
                                  "output_directory": f"{self.tmp_output_dir_path}/{gpu_id}/"})
             for tmp_ligand_file in split_tmp_ligand_paths[i]:
-                shutil.move(tmp_ligand_file, os.path.abspath(f"{self.tmp_ligand_dir_path}/{gpu_id}/"))
+                try:
+                    shutil.copy(tmp_ligand_file, os.path.abspath(f"{self.tmp_ligand_dir_path}/{gpu_id}/"))
+                except FileNotFoundError:
+                    if self.print_msgs:
+                        print(f"Ligand file not found: {tmp_ligand_file}")
 
         # Perform docking procedure(s)
-        # TODO: make not block on _run_vina call here.
         config_paths = [os.path.abspath(f"{self.tmp_config_file_path}_{gpu_id}") for gpu_id in self.gpu_ids]
         vina_cmd_prefixes = [f"CUDA_VISIBLE_DEVICES={gpu_id} " for gpu_id in self.gpu_ids]
         if self.debug:
             self.docking_profiler.time_it(self._run_vina, config_paths, vina_cmd_prefixes=vina_cmd_prefixes, blocking=False)
         else:
             self._run_vina(config_paths, vina_cmd_prefixes=vina_cmd_prefixes, blocking=False)
-
-        # Remove temporary config file(s)
-        for config_path in config_paths:
-            if os.path.exists(config_path):
-                os.remove(config_path)
         
         # Move files from temporary to proper directory (or delete if redoing calculation)
         if self.keep_ligand_file:
@@ -506,7 +363,7 @@ class VinaDocking:
         for i in range(len(smis)):
             binding_scores.append(self._get_output_score(output_paths[i]))
         
-        self._delete_tmp_files()
+        self._delete_tmp_files(tmp_config_file_paths)
         
         return binding_scores
     
@@ -576,7 +433,7 @@ class VinaDocking:
         procs = []
 
         for i in range(len(config_paths)):
-            if vina_cmd_prefixes[i] is not None:
+            if vina_cmd_prefixes is not None and vina_cmd_prefixes[i] is not None:
                 cmd_str = vina_cmd_prefixes[i]
             else:
                 cmd_str = ""
@@ -588,7 +445,7 @@ class VinaDocking:
             if not self.print_vina_output:
                 cmd_str += " > /dev/null 2>&1"
 
-            proc = subprocess.Popen(cmd_str, shell=True, start_new_session=True, cwd=self.vina_cwd)
+            proc = subprocess.Popen(cmd_str, shell=True, start_new_session=False, cwd=self.vina_cwd)
             if blocking:
                 try:
                     proc.wait(timeout=self.timeout_duration)
@@ -604,7 +461,20 @@ class VinaDocking:
                 except subprocess.TimeoutExpired:
                     proc.kill()
     
-    def _delete_tmp_files(self):
+    def _make_dirs(self):
+        make_dir(self.output_dir_path, exist_ok=True)
+        make_dir(self.ligand_dir_path, exist_ok=True)
+        if self.logging_support and self.keep_log_file:
+            make_dir(self.log_dir_path, exist_ok=True)
+        if not self.batch_docking_support:
+            make_dir(self.config_dir_path, exist_ok=True)
+    
+    def _delete_tmp_files(self, tmp_config_file_paths: List[str] = None):
+        if tmp_config_file_paths is not None:
+            for tmp_config_file_path in tmp_config_file_paths:
+                if os.path.exists(tmp_config_file_path):
+                    os.remove(tmp_config_file_path)
+
         if os.path.exists(self.tmp_config_file_path):
             os.remove(self.tmp_config_file_path)
         
@@ -639,36 +509,3 @@ class VinaDocking:
         if os.path.exists(self.output_dir_path):
             shutil.rmtree(self.output_dir_path)
 
-
-def test_preparator():
-    preparation_fn = MeekoLigandPreparator(False, timeout_duration, n_workers=multiprocessing.cpu_count())
-    smiles = data['smiles'].iloc[:10000].tolist()
-    ligand_files = [f"./ligands/{sanitize_smi_name_for_file(x)}.pdbqt" for x in smiles]
-    preparation_fn(smiles, ligand_files)
-
-if __name__ == "__main__":
-    data = data = MolGen(name = 'ZINC').get_data()
-    timeout_duration = None
-
-    preparation_fn = MeekoLigandPreparator(False, timeout_duration, n_workers=multiprocessing.cpu_count())
-
-    delete_all()
-
-    docking_module = VinaDocking("/home/nick/Desktop/MolDocking/Vina-GPU-2.1/QuickVina2-GPU-2.1/QuickVina2-GPU-2-1",
-                                       "advina_module/protein_files/6rqu.pdbqt",
-                                       [7.750, -14.556, 6.747],
-                                       [20, 20, 20],
-                                       keep_ligand_file=True,
-                                       keep_config_file=True,
-                                       keep_log_file=True,
-                                       keep_output_file=True,
-                                       print_vina_output=False,
-                                       print_msgs=True,
-                                       debug=True,
-                                       ligand_preparation_fn=preparation_fn,
-                                       timeout_duration=timeout_duration,
-                                       gpu_ids=None,
-                                       additional_vina_args={"thread": "5000",
-                                                             "opencl_binary_path": "/home/nick/Desktop/MolDocking/Vina-GPU-2.1/QuickVina2-GPU-2.1"})
-    print(docking_module(data['smiles'].iloc[:10]), docking_module.docking_profiler.get_average(), docking_module.preparation_profiler.get_average())
-    exit(1)
