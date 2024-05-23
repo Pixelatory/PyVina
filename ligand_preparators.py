@@ -81,6 +81,7 @@ class OBabelLigandPreparator(PooledWorkerExecutor):
         """
             returns: List containing whether new ligand file was created (True) or is already existing (False)
         """
+        print(smi, ligand_path)
         if smi is type(str):
             smi = [smi]
         if ligand_path is type(str):
@@ -89,6 +90,8 @@ class OBabelLigandPreparator(PooledWorkerExecutor):
         if self.pool_executor is not None:
             tmp = partial(self._prepare_ligand, print_output=self.print_output, timeout_duration=self.timeout_duration)
             res = self.pool_executor.starmap(tmp, zip(smi, ligand_path))
+            #res = res.get()
+            #print(res)
             return res.get()
         else:
             res = []
@@ -144,8 +147,8 @@ class MeekoLigandPreparator:
         self.print_output = print_output
         self.timeout_duration = timeout_duration
 
-        #if not print_output:
-        #    RDLogger.DisableLog('rdApp.*')
+        if not print_output:
+            RDLogger.DisableLog('rdApp.*')
         
         if n_workers != -1:
             self.pool_executor = PooledWorkerExecutor(n_workers, timeout_duration)

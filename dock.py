@@ -3,6 +3,7 @@ import subprocess
 import re
 import time
 import shutil
+import hashlib
 
 from typing import Dict, Iterable, List, Union
 from rdkit import Chem
@@ -27,7 +28,10 @@ def make_dir(rel_path, *args, **kwargs):
     os.makedirs(os.path.abspath(rel_path), *args, **kwargs)
 
 def sanitize_smi_name_for_file(smi: str):
-    return smi.replace('(', '%1').replace(')', '%2').replace('\\', '%3').replace('/', '%4').replace('#', '%5')
+    """
+        Sanitization for file names. Replacement values cannot be part of valid SMILES.
+    """
+    return hashlib.sha224(smi.encode()).hexdigest()
 
 def move_files_from_dir(source_dir_path: str, dest_dir_path: str):
     files = os.listdir(source_dir_path)
