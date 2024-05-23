@@ -6,8 +6,7 @@ import shutil
 
 from typing import Dict, Iterable, List, Union
 from rdkit import Chem
-import pyvina.ligand_preparators
-
+import PyVina.ligand_preparators
 
 def delete_all():
     # DEBUGGING PURPOSES
@@ -28,7 +27,7 @@ def make_dir(rel_path, *args, **kwargs):
     os.makedirs(os.path.abspath(rel_path), *args, **kwargs)
 
 def sanitize_smi_name_for_file(smi: str):
-    return smi.replace('(', '{').replace(')', '}').replace('\\', r'%5C').replace('/', r'%2F').replace('#', '%23')
+    return smi.replace('(', '%1').replace(')', '%2').replace('\\', '%3').replace('/', '%4').replace('#', '%5')
 
 def move_files_from_dir(source_dir_path: str, dest_dir_path: str):
     files = os.listdir(source_dir_path)
@@ -94,9 +93,9 @@ class VinaDocking:
                  keep_output_file: bool = True,
                  keep_log_file: bool = True,
                  keep_config_file: bool = True,
-                 timeout_duration: int = 1000,
+                 timeout_duration: int = None,
                  additional_vina_args: Dict[str, str] = {},
-                 ligand_preparation_fn: callable = pyvina.ligand_preparators.MeekoLigandPreparator(False),
+                 ligand_preparation_fn: callable = PyVina.ligand_preparators.MeekoLigandPreparator(False),
                  vina_cwd: str = None,
                  gpu_ids: Union[int, List[int]] = 0,
                  print_msgs: bool = False,
@@ -104,7 +103,7 @@ class VinaDocking:
                  debug: bool = False) -> None:
         """
             Parameters:
-            - vina_cmd: Command line prefix to execute vina command (e.g. ./qvina2.1)
+            - vina_cmd: Command line prefix to execute vina command (e.g. "/path/to/qvina2.1")
             - receptor_pdbqt_file: Cleaned receptor PDBQT file to use for docking
             - center_pos: 3-dim list containing (x,y,z) coordinates of grid box
             - size: 3-dim list containing sizing information of grid box in (x,y,z) directions
@@ -158,20 +157,19 @@ class VinaDocking:
             self.batch_docking_support = False
         
         if not os.path.isfile(receptor_pdbqt_file):
-            raise Exception(rf'Protein file: {receptor_pdbqt_file} not found')
+            raise Exception(rf'Receptor file: {receptor_pdbqt_file} not found')
         
         if len(center_pos) != 3:
-            raise Exception(f"center_pos must contain 3 values, {center_pos} was provided")
+            raise Exception(f"center_pos must contain 3 values: {center_pos} was provided")
 
         if len(size) != 3:
-            raise Exception(f"size must contain 3 values, {size} was provided")
+            raise Exception(f"size must contain 3 values: {size} was provided")
         
         if print_msgs and not self.logging_support:
             print("Log files are not supported with this Vina command")
-        
+
         if print_msgs and self.batch_docking_support:
             print("Batched docking is enabled; log and config files will not be saved")
-            self.logging_support = False
         elif print_msgs and not self.batch_docking_support:
             print("Batched docking is disabled; not supported with selected Vina version")
 
@@ -202,6 +200,9 @@ class VinaDocking:
                     unknown_gpu_ids.append(gpu_id)
             if len(unknown_gpu_ids) > 0:
                 raise Exception(f"Unknown GPU id(s): {unknown_gpu_ids}")
+            
+        if self.batch_docking_support:
+            self.logging_support = False
 
         self.vina_cmd = vina_cmd
         self.receptor_pdbqt_file = os.path.abspath(receptor_pdbqt_file)
@@ -239,11 +240,15 @@ class VinaDocking:
         """
         if type(smi) is str:
             smi = [smi]
-        smi = [Chem.MolToSmiles(Chem.MolFromSmiles(s), isomericSmiles=True, canonical=True) for s in smi]
+
+        for i in range(len(smi)):
+            mol = Chem.MolFromSmiles(smi[i])
+            if mol is not None:
+                smi[i] = Chem.MolToSmiles(mol, isomericSmiles=True, canonical=True)
         
         self._make_dirs()
 
-        if self.batch_docking_support:
+        if self.batch_docking_support and len(smi) > 1:
             return self._batched_docking(smi)
         else:
             return self._docking(smi)
@@ -286,7 +291,7 @@ class VinaDocking:
         binding_scores = []
         for output_path in output_paths:
             binding_scores.append(self._get_output_score(output_path))
-        
+
         for i in range(len(ligand_paths)):
             if not self.keep_config_file and os.path.exists(config_paths[i]):
                 os.remove(config_paths[i])
@@ -311,12 +316,14 @@ class VinaDocking:
         overlap = [i for i in range(len(smis)) if os.path.exists(output_path_fn(smis[i]))]
         ligand_paths = [ligand_path_fn(smis[i]) for i in range(len(smis)) if i not in overlap]
         tmp_ligand_paths = [tmp_ligand_path_fn(smis[i]) for i in range(len(smis)) if i not in overlap]
+        overlap_smis = [smis[i] for i in range(len(smis)) if i not in overlap]
+
         if self.keep_output_file:
             output_paths = [output_path_fn(smi) for smi in smis]
         else:
             output_paths = [output_path_fn(smis[i]) if i in overlap else tmp_output_path_fn(smis[i]) for i in range(len(smis))]
 
-        self._prepare_ligands(smis, ligand_paths, tmp_ligand_paths)
+        self._prepare_ligands(overlap_smis, ligand_paths, tmp_ligand_paths)
 
         # Multi-GPU docking: move ligands to the gpu_id directories
         split_tmp_ligand_paths = split_list(tmp_ligand_paths, len(self.gpu_ids))
@@ -419,7 +426,6 @@ class VinaDocking:
         
         with open(config_file_path, 'w') as f:
             f.write(conf)
-
         return conf
     
     def _run_vina(self, config_paths: List[List[str]], log_paths: List[List[str]] = None, vina_cmd_prefixes: List[str] = None, blocking: bool = True):
@@ -466,8 +472,7 @@ class VinaDocking:
         make_dir(self.ligand_dir_path, exist_ok=True)
         if self.logging_support and self.keep_log_file:
             make_dir(self.log_dir_path, exist_ok=True)
-        if not self.batch_docking_support:
-            make_dir(self.config_dir_path, exist_ok=True)
+        make_dir(self.config_dir_path, exist_ok=True)
     
     def _delete_tmp_files(self, tmp_config_file_paths: List[str] = None):
         if tmp_config_file_paths is not None:

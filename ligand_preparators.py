@@ -5,6 +5,7 @@ import subprocess
 from typing import List, Union
 from rdkit import Chem
 from rdkit.Chem import AllChem
+from rdkit import RDLogger
 
 def execute_shell_process(cmd_str: str, error_msg: str = None, print_output: bool = False, timeout_duration: int = None) -> bool:
     with subprocess.Popen(cmd_str, shell=True, start_new_session=False) as proc:
@@ -142,6 +143,10 @@ class MeekoLigandPreparator:
         
         self.print_output = print_output
         self.timeout_duration = timeout_duration
+
+        #if not print_output:
+        #    RDLogger.DisableLog('rdApp.*')
+        
         if n_workers != -1:
             self.pool_executor = PooledWorkerExecutor(n_workers, timeout_duration)
         else:
@@ -178,25 +183,28 @@ class MeekoLigandPreparator:
             try:
                 mol = Chem.MolFromSmiles(smi)
 
-                # Add hydrogen and generate 3D coordinates
-                mol = Chem.AddHs(mol)
-                AllChem.EmbedMolecule(mol)
-                AllChem.MMFFOptimizeMolecule(mol)
+                if mol is not None:
+                    # Add hydrogen and generate 3D coordinates
+                    mol = Chem.AddHs(mol)
+                    AllChem.EmbedMolecule(mol)
+                    AllChem.MMFFOptimizeMolecule(mol)
 
-                w = Chem.SDWriter(f'{ligand_path}.sdf')
-                w.write(mol)
-                w.close()
+                    w = Chem.SDWriter(f'{ligand_path}.sdf')
+                    w.write(mol)
+                    w.close()
 
-                cmd_str = f'mk_prepare_ligand.py -i {ligand_path}.sdf -o {ligand_path}'
-                if not print_output:
-                    cmd_str += ' > /dev/null 2>&1'
-                
-                execute_shell_process(cmd_str, f"Error preparing ligand: {smi}")
-                
-                if os.path.isfile(f'{ligand_path}.sdf'):
-                    os.remove(f'{ligand_path}.sdf')
-                
-                return True
+                    cmd_str = f'mk_prepare_ligand.py -i {ligand_path}.sdf -o {ligand_path}'
+                    if not print_output:
+                        cmd_str += ' > /dev/null 2>&1'
+                    
+                    execute_shell_process(cmd_str, f"Error preparing ligand: {smi}")
+                    
+                    if os.path.isfile(f'{ligand_path}.sdf'):
+                        os.remove(f'{ligand_path}.sdf')
+                    
+                    return True
+                else:
+                    return False
             except Exception as e:
                 if print_output:
                     print(f"{smi} could not be prepared: {e}")
