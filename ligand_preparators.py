@@ -43,6 +43,10 @@ class PooledWorkerExecutor:
     def join(self):
         self.pool.join()
 
+    def __del__(self):
+        self.close()
+        self.join()
+
 #TODO: GYPSUM Ligand Preparator https://github.com/durrantlab/gypsum_dl
 #TODO: unidock Ligand Preparator https://github.com/dptech-corp/Uni-Dock/tree/main/unidock_tools
 

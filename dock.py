@@ -317,20 +317,21 @@ class VinaDocking:
         tmp_output_path_fn = lambda smi: os.path.abspath(f"{self.tmp_output_dir_path}{sanitize_smi_name_for_file(smi)}_out.pdbqt")
         
         # not the fastest implementation, but safe if multiple experiments running at same time (with different tmp file paths)
-        overlap = [i for i in range(len(smis)) if os.path.exists(output_path_fn(smis[i]))]
-        ligand_paths = [ligand_path_fn(smis[i]) for i in range(len(smis)) if i not in overlap]
-        tmp_ligand_paths = [tmp_ligand_path_fn(smis[i]) for i in range(len(smis)) if i not in overlap]
-        overlap_smis = [smis[i] for i in range(len(smis)) if i not in overlap]
+        overlap_idxs = [i for i in range(len(smis)) if os.path.exists(output_path_fn(smis[i]))]
+        non_overlap_ligand_paths = [ligand_path_fn(smis[i]) for i in range(len(smis)) if i not in overlap_idxs]
+        non_overlap_tmp_ligand_paths = [tmp_ligand_path_fn(smis[i]) for i in range(len(smis)) if i not in overlap_idxs]
+        non_overlap_smis = [smis[i] for i in range(len(smis)) if i not in overlap_idxs]
 
         if self.keep_output_file:
             output_paths = [output_path_fn(smi) for smi in smis]
         else:
-            output_paths = [output_path_fn(smis[i]) if i in overlap else tmp_output_path_fn(smis[i]) for i in range(len(smis))]
+            output_paths = [output_path_fn(smis[i]) if i in overlap_idxs else tmp_output_path_fn(smis[i]) for i in range(len(smis))]
 
-        self._prepare_ligands(overlap_smis, ligand_paths, tmp_ligand_paths)
+        # Prepare ligands that don't have an existing output file (they aren't overlapping)
+        self._prepare_ligands(non_overlap_smis, non_overlap_ligand_paths, non_overlap_tmp_ligand_paths)
 
         # Multi-GPU docking: move ligands to the gpu_id directories
-        split_tmp_ligand_paths = split_list(tmp_ligand_paths, len(self.gpu_ids))
+        split_tmp_ligand_paths = split_list(non_overlap_tmp_ligand_paths, len(self.gpu_ids))
         tmp_config_file_paths = []
         for i in range(len(self.gpu_ids)):
             gpu_id = self.gpu_ids[i]
@@ -381,7 +382,7 @@ class VinaDocking:
     def _prepare_ligands(self, smis: List[str],
                                ligand_paths: List[str],
                                tmp_ligand_paths: List[str] = None) -> List[bool]:
-        # Copying from ligand_paths to tmp_ligand_paths (batched docking)
+        # Copy file from ligand_paths to tmp_ligand_paths (batched docking)
         if tmp_ligand_paths is not None:
             for i in range(len(ligand_paths)):
                 if os.path.isfile(ligand_paths[i]):
