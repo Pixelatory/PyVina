@@ -141,7 +141,8 @@ class VinaDocking:
             with subprocess.Popen(f"{vina_cmd} --help_advanced",
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    shell=True) as proc:
+                    shell=True,
+                    cwd=vina_cwd) as proc:
                 if proc.wait(timeout=timeout_duration) == 0:
                     result = proc.stdout.read()
                     if result is not None:
@@ -338,8 +339,8 @@ class VinaDocking:
             tmp_config_file_path = f"{self.tmp_config_file_path}_{gpu_id}"
             tmp_config_file_paths.append(tmp_config_file_path)
             self._write_conf_file(tmp_config_file_path,
-                                {"ligand_directory": f"{self.tmp_ligand_dir_path}/{gpu_id}/",
-                                 "output_directory": f"{self.tmp_output_dir_path}/{gpu_id}/"})
+                                {"ligand_directory": f"{self.tmp_ligand_dir_path}{gpu_id}/",
+                                 "output_directory": f"{self.tmp_output_dir_path}{gpu_id}/"})
             for tmp_ligand_file in split_tmp_ligand_paths[i]:
                 try:
                     shutil.copy(tmp_ligand_file, os.path.abspath(f"{self.tmp_ligand_dir_path}/{gpu_id}/"))
@@ -375,8 +376,8 @@ class VinaDocking:
         for i in range(len(smis)):
             binding_scores.append(self._get_output_score(output_paths[i]))
         
-        self._delete_tmp_files(tmp_config_file_paths)
-        
+        #self._delete_tmp_files(tmp_config_file_paths)
+
         return binding_scores
     
     def _prepare_ligands(self, smis: List[str],
@@ -424,10 +425,13 @@ class VinaDocking:
                f'size_z = {self.size[2]}\n'
 
         for k, v in self.additional_vina_args.items():
-            conf += f"{str(k)} = {str(v)} \n"
+            conf += f"{str(k)} = {str(v)}\n"
         
         for k, v in args.items():
-            conf += f"{str(k)} = {str(v)} \n"
+            if self.vina_cwd: # vina_cwd is not none, meaning we have to use global paths for config ligand and output dirs
+                conf += f"{str(k)} = {os.path.join(os.getcwd(), str(v))}\n"
+            else:
+                conf += f"{str(k)} = {str(v)}\n"
         
         with open(config_file_path, 'w') as f:
             f.write(conf)
