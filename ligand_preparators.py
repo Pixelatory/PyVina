@@ -6,7 +6,12 @@ from typing import List, Union
 from rdkit import Chem
 from rdkit.Chem import AllChem
 from rdkit import RDLogger
-from meeko import MoleculePreparation, PDBQTWriterLegacy
+
+try:
+    from meeko import MoleculePreparation, PDBQTWriterLegacy
+    _meeko_available = True
+except ImportError:
+    _meeko_available = False
 
 def execute_shell_process(cmd_str: str, error_msg: str = None, print_output: bool = False, timeout_duration: int = None) -> bool:
     with subprocess.Popen(cmd_str, shell=True, start_new_session=False) as proc:
@@ -144,9 +149,7 @@ class MeekoLigandPreparator:
         Installation: "pip install meeko"
     """
     def __init__(self, print_output: bool, timeout_duration: int = None, n_workers: Union[int, None] = -1) -> None:
-        try:
-            import meeko
-        except ImportError:
+        if not _meeko_available:
             raise Exception("Meeko package isn't installed.")
         
         self.print_output = print_output
@@ -226,9 +229,7 @@ class RGFNLigandPreparator:
         Installation: "pip install meeko"
     """
     def __init__(self, print_output: bool, timeout_duration: int = None, n_workers: Union[int, None] = -1) -> None:
-        try:
-            import meeko
-        except ImportError:
+        if not _meeko_available:
             raise Exception("Meeko package isn't installed.")
         
         self.print_output = print_output

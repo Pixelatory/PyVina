@@ -8,6 +8,7 @@ import hashlib
 from typing import Dict, Iterable, List, Union
 from rdkit import Chem
 import PyVina.ligand_preparators
+from PyVina.utils import get_output_pose, get_output_score, write_conf_file
 
 def delete_all():
     # DEBUGGING PURPOSES
@@ -228,7 +229,6 @@ class VinaDocking:
         self.keep_config_file = keep_config_file
         self.get_pose_str = get_pose_str
         self.timeout_duration = timeout_duration
-        self.additional_vina_args = additional_vina_args
         self.ligand_preparation_fn = ligand_preparation_fn  # should follow format (smiles string, ligand_path)
         self.vina_cwd = vina_cwd
         self.gpu_ids = gpu_ids
@@ -239,6 +239,17 @@ class VinaDocking:
         if debug:
             self.preparation_profiler = TimedProfiler()
             self.docking_profiler = TimedProfiler()
+        
+        self.conf_str = f'receptor = {self.receptor_pdbqt_file}\n' + \
+                        f'center_x = {self.center_pos[0]}\n' + \
+                        f'center_y = {self.center_pos[1]}\n' + \
+                        f'center_z = {self.center_pos[2]}\n' + \
+                        f'size_x = {self.size[0]}\n' + \
+                        f'size_y = {self.size[1]}\n' + \
+                        f'size_z = {self.size[2]}\n'
+        
+        for k, v in additional_vina_args.items():
+            self.conf_str += f"{str(k)} = {str(v)}\n"
     
     def __call__(self, smi: Union[str, List[str]]) -> List[Union[float, None]]:
         """
@@ -284,7 +295,7 @@ class VinaDocking:
             new_ligand_files = self._prepare_ligands(smis, ligand_paths)
         
         for i in range(len(ligand_paths)):
-            self._write_conf_file(config_paths[i], args={"ligand": ligand_paths[i], "out": output_paths_no_overlap[i]})
+            write_conf_file(self.conf_str, config_paths[i], args={"ligand": ligand_paths[i], "out": output_paths_no_overlap[i]})
 
             if self.logging_support and self.keep_log_file:
                 log_path = log_paths[i]
@@ -296,9 +307,18 @@ class VinaDocking:
             else:
                 self._run_vina([config_paths[i]], [log_path])
         
+        # Gather binding scores
         binding_scores = []
         for output_path in output_paths:
-            binding_scores.append(self._get_output_score(output_path))
+            binding_scores.append(self.get_output_score(output_path))
+
+        # Gather binding poses
+        if self.get_pose_str:
+            binding_poses = []
+            for i in range(len(smis)):
+                binding_poses.append(get_output_pose(output_paths[i]))
+            
+            binding_scores = list(zip(binding_scores, binding_poses))
 
         for i in range(len(ligand_paths)):
             if not self.keep_config_file and os.path.exists(config_paths[i]):
@@ -329,62 +349,65 @@ class VinaDocking:
         if self.keep_output_file:
             output_paths = [output_path_fn(smi) for smi in smis]
         else:
+            # If already calculated, will read from output_dir, but if not will save to tmp_output_dir, read output, and then delete the tmp file
             output_paths = [output_path_fn(smis[i]) if i in overlap_idxs else tmp_output_path_fn(smis[i]) for i in range(len(smis))]
+        
+        if self.keep_output_file:
+            output_dir = self.output_dir_path
+        else:
+            output_dir = self.tmp_output_dir_path
 
         # Prepare ligands that don't have an existing output file (they aren't overlapping)
         self._prepare_ligands(non_overlap_smis, non_overlap_ligand_paths, non_overlap_tmp_ligand_paths)
 
-        # Multi-GPU docking: move ligands to the gpu_id directories
+        # GPU docking: move ligands to the gpu_id directories and write config files for docking
+        # For multi-GPU, will use multiple temporary directories
         split_tmp_ligand_paths = split_list(non_overlap_tmp_ligand_paths, len(self.gpu_ids))
         tmp_config_file_paths = []
         for i in range(len(self.gpu_ids)):
             gpu_id = self.gpu_ids[i]
             tmp_config_file_path = f"{self.tmp_config_file_path}_{gpu_id}"
             tmp_config_file_paths.append(tmp_config_file_path)
-            self._write_conf_file(tmp_config_file_path,
-                                {"ligand_directory": f"{self.tmp_ligand_dir_path}{gpu_id}/",
-                                 "output_directory": f"{self.tmp_output_dir_path}{gpu_id}/"})
+            abs_tmp_ligand_dir_path = os.path.abspath(os.path.join(self.tmp_ligand_dir_path, str(gpu_id)))
+
+            write_conf_file(self.conf_str, tmp_config_file_path,
+                            {"ligand_directory": abs_tmp_ligand_dir_path,
+                             "output_directory": output_dir})
             for tmp_ligand_file in split_tmp_ligand_paths[i]:
                 try:
-                    shutil.copy(tmp_ligand_file, os.path.abspath(f"{self.tmp_ligand_dir_path}/{gpu_id}/"))
+                    shutil.copy(tmp_ligand_file, os.path.abspath(abs_tmp_ligand_dir_path))
                 except FileNotFoundError:
                     if self.print_msgs:
                         print(f"Ligand file not found: {tmp_ligand_file}")
 
         # Perform docking procedure(s)
-        config_paths = [os.path.abspath(f"{self.tmp_config_file_path}_{gpu_id}") for gpu_id in self.gpu_ids]
         vina_cmd_prefixes = [f"CUDA_VISIBLE_DEVICES={gpu_id} " for gpu_id in self.gpu_ids]
         if self.debug:
-            self.docking_profiler.time_it(self._run_vina, config_paths, vina_cmd_prefixes=vina_cmd_prefixes, blocking=False)
+            self.docking_profiler.time_it(self._run_vina, tmp_config_file_paths, vina_cmd_prefixes=vina_cmd_prefixes, blocking=False)
         else:
-            self._run_vina(config_paths, vina_cmd_prefixes=vina_cmd_prefixes, blocking=False)
+            self._run_vina(tmp_config_file_paths, vina_cmd_prefixes=vina_cmd_prefixes, blocking=False)
+
+        # Gather binding scores
+        binding_scores = []
+        for i in range(len(smis)):
+            binding_scores.append(get_output_score(output_paths[i]))
+
+        # Gather binding poses
+        if self.get_pose_str:
+            binding_poses = []
+            for i in range(len(smis)):
+                binding_poses.append(get_output_pose(output_paths[i]))
+            
+            binding_scores = list(zip(binding_scores, binding_poses))
 
         # Move files from temporary to proper directory (or delete if redoing calculation)
         if self.keep_ligand_file:
             for gpu_id in self.gpu_ids:
                 move_files_from_dir(f"{self.tmp_ligand_dir_path}/{gpu_id}/", self.ligand_dir_path)
-        else:
-            for gpu_id in self.gpu_ids:
-                delete_dir_contents(f"{self.tmp_ligand_dir_path}/{gpu_id}/")
 
         if self.keep_output_file:
             for gpu_id in self.gpu_ids:
                 move_files_from_dir(f"{self.tmp_output_dir_path}/{gpu_id}/", self.output_dir_path)
-        else:
-            for gpu_id in self.gpu_ids:
-                delete_dir_contents(f"{self.tmp_output_dir_path}/{gpu_id}/")
-        
-        # Gather binding scores
-        binding_scores = []
-        for i in range(len(smis)):
-            binding_scores.append(self._get_output_score(output_paths[i]))
-
-        if self.get_pose_str:
-            binding_poses = []
-            for i in range(len(smis)):
-                binding_poses.append(self._get_output_pose(output_paths[i]))
-            
-            binding_scores = list(zip(binding_scores, binding_poses))
 
         self._delete_tmp_files(tmp_config_file_paths)
 
@@ -411,50 +434,6 @@ class VinaDocking:
             return self.preparation_profiler.time_it(self.ligand_preparation_fn, smis, save_ligand_path)
         else:
             return self.ligand_preparation_fn(smis, save_ligand_path)
-    
-    @staticmethod
-    def _get_output_score(output_path: str) -> Union[float, None]:
-        try:
-            score = float("inf")
-            with open(output_path, 'r') as f:
-                for line in f.readlines():
-                    if "REMARK VINA RESULT" in line:
-                        new_score = re.findall(r'([-+]?[0-9]*\.?[0-9]+)', line)[0]
-                        score = min(score, float(new_score))
-            return score
-        except FileNotFoundError:
-            return None
-
-    @staticmethod
-    def _get_output_pose(output_path: str) -> Union[str, None]:
-        try:
-            with open(output_path, 'r') as f:
-                docked_pdbqt = f.read()
-            return docked_pdbqt
-        except FileNotFoundError:
-            return None
-
-    def _write_conf_file(self, config_file_path: str, args: Dict[str, str] = {}):
-        conf = f'receptor = {self.receptor_pdbqt_file}\n' + \
-               f'center_x = {self.center_pos[0]}\n' + \
-               f'center_y = {self.center_pos[1]}\n' + \
-               f'center_z = {self.center_pos[2]}\n' + \
-               f'size_x = {self.size[0]}\n' + \
-               f'size_y = {self.size[1]}\n' + \
-               f'size_z = {self.size[2]}\n'
-
-        for k, v in self.additional_vina_args.items():
-            conf += f"{str(k)} = {str(v)}\n"
-        
-        for k, v in args.items():
-            if self.vina_cwd: # vina_cwd is not none, meaning we have to use global paths for config ligand and output dirs
-                conf += f"{str(k)} = {os.path.join(os.getcwd(), str(v))}\n"
-            else:
-                conf += f"{str(k)} = {str(v)}\n"
-        
-        with open(config_file_path, 'w') as f:
-            f.write(conf)
-        return conf
     
     def _run_vina(self, config_paths: List[List[str]], log_paths: List[List[str]] = None, vina_cmd_prefixes: List[str] = None, blocking: bool = True):
         """
@@ -525,7 +504,6 @@ class VinaDocking:
         # Multi-GPU: multiple ligand directories
         for gpu_id in self.gpu_ids:
             make_dir(f"{self.tmp_ligand_dir_path}/{gpu_id}/", exist_ok=True)
-            make_dir(f"{self.tmp_output_dir_path}/{gpu_id}/", exist_ok=True)
         
     def delete_files(self):
         self._delete_tmp_files()
